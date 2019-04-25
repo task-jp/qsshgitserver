@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/">
+        <file>server-key-rsa.der</file>
+    </qresource>
+</RCC>
