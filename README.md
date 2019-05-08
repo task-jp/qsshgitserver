@@ -7,7 +7,7 @@
 
 ## Build
 ```
-$ qmake "LIBS+=-L/path/to/wolfssl/lib -lwolfssl -L/path/to/wolfssh/lib -lwolfssh" "INCLUDEPATH+=/path/to/wolfssl/include /path/to/local/wolfssh/include"
+$ qmake "LIBS+=-L/path/to/wolfssl/lib -lwolfssl -L/path/to/wolfssh/lib -lwolfssh" "INCLUDEPATH+=/path/to/wolfssl/include /path/to/wolfssh/include"
 $ make
 ```
 
