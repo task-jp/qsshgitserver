@@ -14,3 +14,5 @@ SOURCES += \
 
 RESOURCES += \
     keys.qrc
+
+LIBS += -lwolfssl -lwolfssh
