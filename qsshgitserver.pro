@@ -1,18 +1,16 @@
 QT = core network
 
-CONFIG += console
-CONFIG -= app_bundle
+CONFIG += cmdline
 
 HEADERS += \
+    abstractsshobject.h \
     sshserver.h \
     sshsession.h
 
 SOURCES += \
+    abstractsshobject.cpp \
         main.cpp \
     sshserver.cpp \
     sshsession.cpp
 
-RESOURCES += \
-    keys.qrc
-
-LIBS += -lwolfssl -lwolfssh
+LIBS += -lssh

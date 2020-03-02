@@ -3,25 +3,25 @@
 
 #include <QtCore/QIODevice>
 
-struct WOLFSSH_CTX;
+class SshServer;
+
+struct ssh_bind_struct;
+typedef struct ssh_bind_struct* ssh_bind;
 
 class SshSession : public QIODevice
 {
     Q_OBJECT
 public:
-    explicit SshSession(WOLFSSH_CTX *ctx, qintptr socketDescriptor, QObject *parent = nullptr);
+    explicit SshSession(ssh_bind ssh, SshServer *parent = nullptr);
     ~SshSession() override;
-
-    bool open(OpenMode mode) override;
-    void close() override;
-
-    qint64 bytesAvailable() const override;
-    qint64 bytesToWrite() const override;
 
 signals:
     void exec(const QByteArray &command);
     void shell();
     void errorOccurred();
+
+public slots:
+    void exit(int exit_status);
 
 protected:
     qint64 readData(char *data, qint64 maxlen) override;

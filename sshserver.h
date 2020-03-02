@@ -1,20 +1,22 @@
 #ifndef SSHSERVER_H
 #define SSHSERVER_H
 
-#include <QtNetwork/QTcpServer>
+#include <QtCore/QObject>
 
-class SshServer : public QTcpServer
+class SshSession;
+
+struct ssh_key_struct;
+typedef struct ssh_key_struct* ssh_key;
+
+class SshServer : public QObject
 {
     Q_OBJECT
 public:
     explicit SshServer(QObject *parent = nullptr);
     ~SshServer() override;
 
-public slots:
-signals:
-
-protected:
-    void incomingConnection(qintptr socketDescriptor) override;
+    bool authPassword(const char *user, const char *password) const;
+    bool authPublicKey(ssh_key key) const;
 
 private:
     class Private;

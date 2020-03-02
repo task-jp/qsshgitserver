@@ -1,208 +1,166 @@
 #include "sshsession.h"
+#include "sshserver.h"
+#include "abstractsshobject.h"
 
 #include <QtCore/QDebug>
 #include <QtCore/QSocketNotifier>
 
-#include <wolfssh/ssh.h>
+#include <libssh/libssh.h>
+#include <libssh/server.h>
 
-class SshSession::Private
+class SshSession::Private : public AbstractSshObject
 {
 public:
-    Private(WOLFSSH_CTX *ctx, qintptr socketDescriptor, SshSession *parent);
+    Private(ssh_bind ssh, SshSession *parent);
+    ~Private() override;
 
-    bool open(OpenMode openMode);
-    void close();
-    void read();
-    void write();
-
+    void exit(int exit_status);
 private:
-    void accept();
+    bool read();
 
 private:
     SshSession *q;
-
+    QSocketNotifier *socketNotifier;
+    ssh_session session;
 public:
-    WOLFSSH_CTX *ctx;
-    int socketDescriptor;
-    WOLFSSH *ssh;
-    QSocketNotifier readNotifier;
-    QByteArray input;
-    QSocketNotifier writeNotifier;
-    QByteArray output;
-    bool accepted;
+    ssh_channel channel;
 };
 
-SshSession::Private::Private(WOLFSSH_CTX *ctx, qintptr socketDescriptor, SshSession *parent)
-    : q(parent)
-    , ctx(ctx)
-    , socketDescriptor(static_cast<int>(socketDescriptor))
-    , ssh(nullptr)
-    , readNotifier(socketDescriptor, QSocketNotifier::Read)
-    , writeNotifier(socketDescriptor, QSocketNotifier::Write)
-    , accepted(false)
+SshSession::Private::Private(ssh_bind ssh, SshSession *parent)
+    : AbstractSshObject(ssh)
+    , q(parent)
+    , socketNotifier(nullptr)
+    , session(ssh_new())
+    , channel(nullptr)
 {
-    readNotifier.setEnabled(false);
-    connect(&readNotifier, &QSocketNotifier::activated, [this]() { read(); });
-    writeNotifier.setEnabled(false);
-    connect(&writeNotifier, &QSocketNotifier::activated, [this]() { write(); });
-}
-
-bool SshSession::Private::open(SshSession::OpenMode openMode)
-{
-    if (!ctx)
-        return false;
-    ssh = wolfSSH_new(ctx);
-
-    if (!ssh) {
-        qWarning("wolfSSH_new failed");
-        return false;
-    }
-    int ret = wolfSSH_set_fd(ssh, (int)socketDescriptor);
-    if (ret != WS_SUCCESS) {
-        qWarning("wolfSSH_set_fd failed");
-        wolfSSH_free(ssh);
-        return false;
-    }
-    wolfSSH_SetUserAuthCtx(ssh, q->parent());
-
-    readNotifier.setEnabled(openMode & ReadOnly);
-    writeNotifier.setEnabled(openMode & WriteOnly);
-    return true;
-}
-
-void SshSession::Private::close()
-{
-    if (!ssh)
+    if (isError(ssh_bind_accept(ssh, session), "ssh_bind_accept"))
         return;
 
-    int ret = wolfSSH_stream_exit(ssh, 0);
-    if (ret != WS_SUCCESS) {
-        qWarning("wolfSSH_stream_exit failed");
-    }
+    ssh_set_blocking(session, 0);
+    ssh_handle_key_exchange(session);
 
-    ::close(socketDescriptor);
-    wolfSSH_free(ssh);
-    ssh = nullptr;
-}
-
-void SshSession::Private::read()
-{
-    if (!accepted) {
-        accept();
-        return;
-    }
-    char buffer[32768];
-    int size = input.length();
-    bool eof = false;
-    while (!eof) {
-        int ret = wolfSSH_stream_read(ssh, reinterpret_cast<byte *>(buffer), sizeof(buffer));
-        if (ret > 0) {
-            input.append(buffer, ret);
+    socketNotifier = new QSocketNotifier(ssh_get_fd(session), QSocketNotifier::Read, q);
+    QMetaObject::Connection connection;
+    connection = connect(socketNotifier, &QSocketNotifier::activated, [connection, this]() {
+        if (!read()) {
+            disconnect(connection);
         } else {
-            int error = wolfSSH_get_error(ssh);
-            switch (ret) {
-            case WS_SUCCESS:
-                break;
-            case WS_FATAL_ERROR:
-                switch (error) {
-                case WS_WANT_READ:
-                    break;
-                case WS_SOCKET_ERROR_E:
-                    qDebug() << wolfSSH_get_error_name(ssh);
-                    emit q->errorOccurred();
-                    break;
-                default:
-                    qWarning() << error;
+            connect(socketNotifier, &QSocketNotifier::activated, q, &QIODevice::readyRead);
+        }
+    });
+}
+
+void SshSession::Private::exit(int exit_status)
+{
+    ssh_set_blocking(session, 1);
+
+    if (isError(ssh_channel_request_send_exit_status(channel, exit_status), "ssh_channel_request_send_exit_status"))
+        return;
+
+    if (isError(ssh_channel_send_eof(channel), "ssh_channel_send_eof"))
+        return;
+
+    if (isError(ssh_channel_close(channel), "ssh_channel_close"))
+        return;
+
+    qDebug() << q->readAll();
+    ssh_channel_free(channel);
+    isError(ssh_blocking_flush(session, -1), "ssh_blocking_flush");
+    q->deleteLater();
+}
+
+bool SshSession::Private::read()
+{
+    bool ret = true;
+    while (true) {
+        ssh_message message = ssh_message_get(session);
+        if (!message) {
+            break;
+        }
+        int type = ssh_message_type(message);
+        int subtype = ssh_message_subtype(message);
+        bool replied = false;
+        switch (type) {
+        case SSH_REQUEST_AUTH:
+            switch (subtype) {
+            case SSH_AUTH_METHOD_PASSWORD: {
+                auto user = ssh_message_auth_user(message);
+                auto pass = ssh_message_auth_password(message);
+                if (qobject_cast<SshServer *>(q->parent())->authPassword(user, pass)) {
+                    ssh_message_auth_reply_success(message, 0);
+                    replied = true;
                 }
-                break;
-            case WS_EOF:
-                switch (error) {
-                case WS_WANT_READ:
-                    break;
-                case WS_SOCKET_ERROR_E:
-                    qDebug() << wolfSSH_get_error_name(ssh);
-                    emit q->errorOccurred();
-                    break;
-                default:
-                    qWarning() << error << wolfSSH_get_error_name(ssh);
-                    eof = true;
+                break; }
+            case SSH_AUTH_METHOD_PUBLICKEY: {
+                auto key = ssh_message_auth_pubkey(message);
+                if (qobject_cast<SshServer *>(q->parent())->authPublicKey(key)) {
+                    ssh_message_auth_reply_success(message, 0);
+                    replied = true;
                 }
+                break; }
+            default:
+                qWarning() << "SSH_REQUEST_AUTH: subtype" << subtype << "not handled";
+                break;
+            }
+            if (!replied) {
+                ssh_message_auth_set_methods(message,
+                                             SSH_AUTH_METHOD_PASSWORD |
+                                             SSH_AUTH_METHOD_PUBLICKEY);
+            }
+            break;
+        case SSH_REQUEST_CHANNEL_OPEN:
+            switch (subtype) {
+            case SSH_CHANNEL_SESSION:
+                channel = ssh_message_channel_request_open_reply_accept(message);
+                replied = true;
                 break;
             default:
-                qWarning() << ret << "not handled";
+                qWarning() << "SSH_REQUEST_CHANNEL_OPEN: subtype" << subtype << "not handled";
                 break;
             }
             break;
-        }
-    }
-    if (size < input.length()) {
-//        qDebug() << input;
-        emit q->readyRead();
-    }
-}
-
-void SshSession::Private::accept()
-{
-    accepted = (wolfSSH_accept(ssh) == WS_SUCCESS);
-
-    if (accepted) {
-        switch (wolfSSH_GetSessionType(ssh)) {
-        case WOLFSSH_SESSION_EXEC:
-            emit q->exec(QByteArray(wolfSSH_GetSessionCommand(ssh)));
-            break;
-        case WOLFSSH_SESSION_SHELL:
-            emit q->shell();
+        case SSH_REQUEST_CHANNEL:
+            switch (subtype) {
+            case SSH_CHANNEL_REQUEST_SHELL:
+                ssh_message_channel_request_reply_success(message);
+                replied = true;
+                emit q->shell();
+                ret = false;
+                break;
+            case SSH_CHANNEL_REQUEST_EXEC: {
+                QByteArray command(ssh_message_channel_request_command(message));
+                replied = true;
+                emit q->exec(command);
+                ret = false;
+                break; }
+            default:
+                qWarning() << "SSH_REQUEST_CHANNEL: subtype" << subtype << "not handled";
+                break;
+            }
             break;
         default:
-            qWarning("wolfSSH_GetSessionType() %d not suported", wolfSSH_GetSessionType(ssh));
-            emit q->errorOccurred();
+            qDebug() << type << subtype;
             break;
         }
-    }
-}
-void SshSession::Private::write()
-{
-    int written = 0;
-    byte *data = reinterpret_cast<byte *>(output.data());
-    word32 len = output.length();
-    while (len != written) {
-//        qDebug() << output;
-        int ret = wolfSSH_stream_send(ssh, data + written, len - written);
-        if (ret > 0) {
-            written += ret;
-        } else {
-            int error = wolfSSH_get_error(ssh);
-            switch (ret) {
-            case WS_SUCCESS:
-                break;
-            case WS_FATAL_ERROR:
-                switch (error) {
-                case WS_WANT_WRITE:
-                    break;
-                default:
-                    qWarning() << error;
-                }
-                break;
-            case WS_EOF:
-                qFatal("WF_EOF");
-                break;
-            default:
-                qWarning() << ret << "not handled";
-                break;
-            }
-            break;
+
+        if (!replied) {
+            ssh_message_reply_default(message);
         }
+        ssh_message_free(message);
     }
-    if (written > 0) {
-        output = output.mid(written);
-//        qDebug() << output;
-        emit q->bytesWritten(written);
-    }
+    return ret;
 }
 
-SshSession::SshSession(WOLFSSH_CTX *ctx, qintptr socketDescriptor, QObject *parent)
+SshSession::Private::~Private()
+{
+    qDebug() << q;
+    ssh_disconnect(session);
+    ssh_free(session);
+}
+
+SshSession::SshSession(ssh_bind ssh, SshServer *parent)
     : QIODevice(parent)
-    , d(new Private(ctx, socketDescriptor, this))
+    , d(new Private(ssh, this))
 {
     open(ReadWrite);
 }
@@ -213,42 +171,21 @@ SshSession::~SshSession()
     delete d;
 }
 
-bool SshSession::open(SshSession::OpenMode mode)
-{
-    if (!d->open(mode)) {
-        return false;
-    }
-    return QIODevice::open(mode);
-}
-
-void SshSession::close()
-{
-    d->close();
-    QIODevice::close();
-}
-
-qint64 SshSession::bytesAvailable() const
-{
-    return d->input.length();
-}
-
-qint64 SshSession::bytesToWrite() const
-{
-    return d->output.length();
-}
-
 qint64 SshSession::readData(char *data, qint64 maxlen)
 {
-    d->read();
-    qint64 ret = std::min<qint64>(d->input.length(), maxlen);
-    memcpy(data, d->input.constData(), ret);
-    d->input = d->input.mid(ret);
+    auto ret = ssh_channel_read(d->channel, data, maxlen, 0);
+//    qDebug() << ret;
     return ret;
 }
 
 qint64 SshSession::writeData(const char *data, qint64 len)
 {
-    d->output.append(data, len);
-    d->write();
-    return len;
+    auto ret = ssh_channel_write(d->channel, data, len);
+//    qDebug() << len << ret;
+    return ret;
+}
+
+void SshSession::exit(int exit_status)
+{
+    d->exit(exit_status);
 }

@@ -8,8 +8,6 @@ int main(int argc, char *argv[])
     QCoreApplication app(argc, argv);
 
     SshServer server;
-    if (!server.listen(QHostAddress::LocalHost, 22222))
-        return -1;
 
     return QCoreApplication::exec();
 }
